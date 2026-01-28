@@ -45,4 +45,4 @@ Create an executable named `git-interactive-<name>` and place it in `$PATH`. It 
 
 ## Current plugins
 
-### [git interactive signing-key](src/git-interactive-signing-key/README.md) - interactively change signing key for current repo (default) or globally (--global)
+* [git interactive signing-key](src/git-interactive-signing-key/README.md) - interactively change signing key for current repo (default) or globally (--global)
