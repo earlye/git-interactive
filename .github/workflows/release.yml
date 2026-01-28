@@ -95,16 +95,17 @@ jobs:
       - name: Trigger Homebrew tap update
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          PAYLOAD: |
+            {
+              "formula": "git-interactive",
+              "template_url": "https://raw.githubusercontent.com/earlye/git-interactive/v${{ needs.version.outputs.version }}/homebrew/git-interactive.rb.template",
+              "version": "${{ needs.version.outputs.version }}",
+              "arm64_url": "https://github.com/earlye/git-interactive/releases/download/v${{ needs.version.outputs.version }}/git-interactive-darwin-arm64-v${{ needs.version.outputs.version }}.tar.gz",
+              "arm64_sha": "${{ needs.release.outputs.arm64_sha }}",
+              "x86_64_url": "https://github.com/earlye/git-interactive/releases/download/v${{ needs.version.outputs.version }}/git-interactive-darwin-x86_64-v${{ needs.version.outputs.version }}.tar.gz",
+              "x86_64_sha": "${{ needs.release.outputs.x86_64_sha }}"
+            }
         run: |
-          VERSION="${{ needs.version.outputs.version }}"
           gh api repos/earlye/homebrew-tap/dispatches \
             -f event_type=update-formula \
-            -f client_payload="{
-              \"formula\": \"git-interactive\",
-              \"template_url\": \"https://raw.githubusercontent.com/earlye/git-interactive/v${VERSION}/homebrew/git-interactive.rb.template\",
-              \"version\": \"${VERSION}\",
-              \"arm64_url\": \"https://github.com/earlye/git-interactive/releases/download/v${VERSION}/git-interactive-darwin-arm64-v${VERSION}.tar.gz\",
-              \"arm64_sha\": \"${{ needs.release.outputs.arm64_sha }}\",
-              \"x86_64_url\": \"https://github.com/earlye/git-interactive/releases/download/v${VERSION}/git-interactive-darwin-x86_64-v${VERSION}.tar.gz\",
-              \"x86_64_sha\": \"${{ needs.release.outputs.x86_64_sha }}\"
-            }"
+            -F client_payload="${PAYLOAD}"
