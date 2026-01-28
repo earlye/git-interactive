@@ -107,6 +107,7 @@ jobs:
             }
         run: |
           export PAYLOAD=$(echo "${PAYLOAD}" | jq -Mc '.')
+          set -x # let's see what we're sending
           gh api repos/earlye/homebrew-tap/dispatches \
             -f event_type=update-formula \
             -F "client_payload=${PAYLOAD}"
