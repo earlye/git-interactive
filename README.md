@@ -42,3 +42,7 @@ export PATH="$PATH:$HOME/.git-interactive/bin"
 ## Creating Plugins
 
 Create an executable named `git-interactive-<name>` and place it in `$PATH`. It will be invoked when running `git interactive <name>`.
+
+## Current plugins
+
+### [git interactive signing-key](src/git-interactive-signing-key/README.md) - interactively change signing key for current repo (default) or globally (--global)
