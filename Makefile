@@ -1,8 +1,13 @@
 TARGETS := $(notdir $(wildcard src/*))
 BINARIES := $(addprefix dist/bin/, $(TARGETS))
-$(info entering directory `$(shell pwd)')
-$(info TARGETS: $(TARGETS))
-$(info BINARIES: $(BINARIES))
+MAJOR := 0
+MINOR := 1
+PATCH ?= 99999+local-$(shell git rev-parse --abbrev-ref HEAD 2> /dev/null)-$(shell git rev-list --count HEAD 2>/dev/null)-$(shell git rev-parse --short HEAD)
+VERSION := $(MAJOR).$(MINOR).$(PATCH)
+log = $(if $(QUIET),,$(info $(1)))
+
+$(call log,entering directory `$(shell pwd)')
+$(call log,VERSION: $(VERSION))
 
 .PHONY: all FORCE
 all: $(BINARIES)
@@ -17,3 +22,7 @@ dist:
 
 link: dist
 	ln -s $(abspath dist) ~/.git-interactive
+
+.PHONY: version
+version:
+	@printf $(VERSION)

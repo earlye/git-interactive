@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      patch: ${{ steps.version.outputs.patch }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Calculate version
+        id: version
+        run: |
+          PATCH="${{ github.run_number }}+$(git rev-parse --short HEAD)"
+          VERSION=$(make QUIET=1 version PATCH="$PATCH")
+          echo "patch=$PATCH" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  build:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest    # Apple Silicon runner
+            name: darwin-arm64
+          - os: macos-13        # Intel runner
+            name: darwin-x86_64
+    
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Build
+        run: make PATCH="${{ needs.version.outputs.patch }}" QUIET=1
+      
+      - name: Package
+        run: |
+          tar -czvf git-interactive-${{ matrix.name }}-v${{ needs.version.outputs.version }}.tar.gz -C dist/bin .
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-interactive-${{ matrix.name }}
+          path: git-interactive-*.tar.gz
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      
+      - name: List artifacts
+        run: ls -la artifacts/
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: v${{ needs.version.outputs.version }}
+          files: artifacts/*.tar.gz
+          generate_release_notes: true
