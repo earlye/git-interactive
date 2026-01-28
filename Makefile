@@ -1,3 +1,10 @@
+ifdef QUIET
+  MAKE_FLAGS += --no-print-directory
+  Q := @
+else
+  Q :=
+endif
+
 TARGETS := $(notdir $(wildcard src/*))
 BINARIES := $(addprefix dist/bin/, $(TARGETS))
 MAJOR := 0
@@ -11,17 +18,18 @@ $(call log,VERSION: $(VERSION))
 
 .PHONY: all FORCE
 all: $(BINARIES)
+	@:
 
 FORCE:
 dist/bin/%: FORCE
-	mkdir -p $(dir $@)
-	make -C src/$* DIST_DIR=$(abspath $(dir $@))
+	$(Q) mkdir -p $(dir $@)
+	$(Q) make -C src/$* DIST_DIR=$(abspath $(dir $@))
 
 dist:
-	mkdir -p dist
+	$(Q) mkdir -p dist
 
-link: dist
-	ln -s $(abspath dist) ~/.git-interactive
+link: dist FORCE
+	$(Q) ln -s $(abspath dist) ~/.git-interactive
 
 .PHONY: version
 version:

@@ -7,6 +7,10 @@ $(if $(DIST_DIR),,$(error DIST_DIR is not set))
 
 EXECUTABLE := $(DIST_DIR)/git-interactive
 
+.PHONY: all
+all: $(EXECUTABLE)
+	@:
+
 $(EXECUTABLE): src/git-interactive.sh
 	cp $< $@
 	chmod +x $@
