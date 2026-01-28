@@ -106,8 +106,9 @@ jobs:
               "x86_64_sha": "${{ needs.release.outputs.x86_64_sha }}"
             }
         run: |
-          export PAYLOAD=$(echo "${PAYLOAD}" | jq -Mc '.')
           set -x # let's see what we're sending
-          gh api repos/earlye/homebrew-tap/dispatches \
-            -f event_type=update-formula \
-            -F "client_payload=${PAYLOAD}"
+          jq -Mc -n \
+            --arg event_type "update-formula" \
+            --argjson client_payload "$PAYLOAD" \
+            '{event_type: $event_type, client_payload: $client_payload}' \
+            | gh api repos/earlye/homebrew-tap/dispatches --input -
