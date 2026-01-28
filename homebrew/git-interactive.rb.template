@@ -1,0 +1,26 @@
+class GitInteractive < Formula
+  desc "Extensible interactive Git TUI"
+  homepage "https://github.com/earlye/git-interactive"
+  license "MIT"
+  version "${version}"
+
+  on_macos do
+    on_arm do
+      url "${arm64_url}"
+      sha256 "${arm64_sha}"
+    end
+    on_intel do
+      url "${x86_64_url}"
+      sha256 "${x86_64_sha}"
+    end
+  end
+
+  def install
+    bin.install "git-interactive"
+    bin.install "git-interactive-signing-key"
+  end
+
+  test do
+    assert_match "Usage:", shell_output("#{bin}/git-interactive 2>&1", 1)
+  end
+end

@@ -57,6 +57,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      arm64_sha: ${{ steps.sha.outputs.arm64 }}
+      x86_64_sha: ${{ steps.sha.outputs.x86_64 }}
     
     steps:
       - name: Download artifacts
@@ -68,6 +71,14 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
       
+      - name: Calculate SHA256
+        id: sha
+        run: |
+          ARM64_SHA=$(shasum -a 256 artifacts/*darwin-arm64*.tar.gz | cut -d' ' -f1)
+          X86_64_SHA=$(shasum -a 256 artifacts/*darwin-x86_64*.tar.gz | cut -d' ' -f1)
+          echo "arm64=$ARM64_SHA" >> $GITHUB_OUTPUT
+          echo "x86_64=$X86_64_SHA" >> $GITHUB_OUTPUT
+      
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -75,3 +86,25 @@ jobs:
           name: v${{ needs.version.outputs.version }}
           files: artifacts/*.tar.gz
           generate_release_notes: true
+
+  update-homebrew:
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Trigger Homebrew tap update
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          gh api repos/earlye/homebrew-tap/dispatches \
+            -f event_type=update-formula \
+            -f client_payload="{
+              \"formula\": \"git-interactive\",
+              \"template_url\": \"https://raw.githubusercontent.com/earlye/git-interactive/v${VERSION}/homebrew/git-interactive.rb.template\",
+              \"version\": \"${VERSION}\",
+              \"arm64_url\": \"https://github.com/earlye/git-interactive/releases/download/v${VERSION}/git-interactive-darwin-arm64-v${VERSION}.tar.gz\",
+              \"arm64_sha\": \"${{ needs.release.outputs.arm64_sha }}\",
+              \"x86_64_url\": \"https://github.com/earlye/git-interactive/releases/download/v${VERSION}/git-interactive-darwin-x86_64-v${VERSION}.tar.gz\",
+              \"x86_64_sha\": \"${{ needs.release.outputs.x86_64_sha }}\"
+            }"
