@@ -109,4 +109,4 @@ jobs:
           export PAYLOAD=$(echo "${PAYLOAD}" | jq -Mc '.')
           gh api repos/earlye/homebrew-tap/dispatches \
             -f event_type=update-formula \
-            -F client_payload:="${PAYLOAD}"
+            -F "client_payload=${PAYLOAD}"
