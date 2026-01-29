@@ -30,6 +30,13 @@ git-interactive/
 
 ## Installation
 
+From homebrew:
+```bash
+brew tap earlye/tap
+brew install git-interactive
+```
+
+From source:
 ```bash
 # Add to PATH directly
 export PATH="$PATH:/path/to/git-interactive/dist/bin"
