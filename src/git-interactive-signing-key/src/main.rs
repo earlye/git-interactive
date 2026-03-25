@@ -197,12 +197,12 @@ fn run_app(
                     {
                         return Ok(None)
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
+                    KeyCode::Up => {
                         let i = list_state.selected().unwrap_or(0);
                         let new_i = if i == 0 { keys.len() - 1 } else { i - 1 };
                         list_state.select(Some(new_i));
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    KeyCode::Down => {
                         let i = list_state.selected().unwrap_or(0);
                         let new_i = if i >= keys.len() - 1 { 0 } else { i + 1 };
                         list_state.select(Some(new_i));

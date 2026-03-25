@@ -19,7 +19,7 @@ git interactive signing-key [--local|--global]
 
 1. Lists available GPG secret keys (from `gpg --list-secret-keys`)
 2. Highlights the currently configured signing key (if any)
-3. Navigate with `↑`/`↓` arrow keys or `j`/`k` (vi-style)
+3. Navigate with **arrow Up** / **arrow Down**
 4. Press `Enter` to select and update git config
 5. Press `Ctrl+C` to cancel without changes
 

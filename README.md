@@ -26,7 +26,8 @@ git-interactive/
 ├── src/
 │   ├── git-interactive/              # Main dispatcher
 │   ├── git-interactive-signing-key/  # GPG signing key selector
-│   └── git-interactive-repos/        # Multi-repo overview
+│   ├── git-interactive-repos/        # Multi-repo overview
+│   └── git-interactive-repo/         # Single-repo branch/status detail
 ```
 
 ## Installation
@@ -55,5 +56,6 @@ Create an executable named `git-interactive-<name>` and place it in `$PATH`. It 
 
 * [git interactive signing-key](src/git-interactive-signing-key/README.md) - interactively change signing key for current repo (default) or globally (--global)
 * [git interactive repos](src/git-interactive-repos/README.md) - list sibling directories as git repos with branch/dirty state and quick actions
+* [git interactive repo](src/git-interactive-repo/README.md) - branch and status UI for one repository (optional `PATH`, default `.`)
 
 <!-- Version Bump: 2 -->

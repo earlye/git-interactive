@@ -1,9 +1,8 @@
-//! `git interactive repos` — browse sibling directories as git workspaces.
+//! `git interactive repo` — branch and status UI for a single git repository.
 
 use std::io::{self, stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -15,23 +14,19 @@ use crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Parser)]
-#[command(name = "git-interactive-repos")]
-#[command(about = "Interactive overview of git repos in the current directory")]
-struct Args {}
+#[command(name = "git-interactive-repo")]
+#[command(about = "Interactive branch and status for a single git repository")]
+struct Args {
+    /// Path to the repository (default: current directory)
+    #[arg(value_name = "PATH")]
+    path: Option<PathBuf>,
+}
 
 #[derive(Clone, Debug)]
 enum Row {
-    Scanning {
-        name: String,
-        path: PathBuf,
-    },
-    NotGit {
-        name: String,
-        path: PathBuf,
-    },
     Git {
         name: String,
         path: PathBuf,
@@ -60,9 +55,6 @@ impl FocusField {
 }
 
 enum AppMode {
-    TopLevel {
-        list_state: ListState,
-    },
     RepoDetail {
         repo_idx: usize,
         focus: FocusField,
@@ -117,8 +109,6 @@ enum AppMode {
 struct App {
     rows: Vec<Row>,
     mode: AppMode,
-    /// Updates from background probes: (index, new row).
-    rx: mpsc::Receiver<(usize, Row)>,
     /// Last `frame.area()` from [`Terminal::draw`], for status scroll viewport math.
     last_area: Rect,
     /// Deferred `AppMode` switch (avoids borrowing `mode` while `RepoDetail` fields are borrowed).
@@ -131,20 +121,27 @@ enum RunOutcome {
 }
 
 fn main() -> io::Result<()> {
-    let _args = Args::parse();
+    let args = Args::parse();
 
-    let cwd = std::env::current_dir()?;
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&cwd)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .map(|e| e.path())
-        .collect();
-    entries.sort();
+    let raw_path = args.path.unwrap_or_else(|| PathBuf::from("."));
+    let path = std::fs::canonicalize(&raw_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("{}: {}", raw_path.display(), e),
+        )
+    })?;
 
-    if entries.is_empty() {
-        println!("No subdirectories in {}.", cwd.display());
-        return Ok(());
+    if !is_git_repo(&path) {
+        eprintln!("Not a git repository: {}", path.display());
+        std::process::exit(1);
     }
+
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    let row = probe_repo(name, path);
 
     let (tw, _) = crossterm::terminal::size()?;
     // inner list width ≈ tw − border; content column ≈ inner − 1 for `>` highlight prefix
@@ -154,46 +151,11 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let (tx, rx) = mpsc::channel::<(usize, Row)>();
-    for (idx, path) in entries.iter().enumerate() {
-        let tx = tx.clone();
-        let path = path.clone();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-        std::thread::spawn(move || {
-            let row = probe_repo(name, path);
-            let _ = tx.send((idx, row));
-        });
-    }
-    drop(tx);
-
-    let rows: Vec<Row> = entries
-        .iter()
-        .map(|p| {
-            let name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            Row::Scanning {
-                name,
-                path: p.clone(),
-            }
-        })
-        .collect();
-
-    let mut list_state = ListState::default();
-    if !rows.is_empty() {
-        list_state.select(Some(0));
-    }
-
+    let rows = vec![row];
+    let mode = load_repo_detail(0, FocusField::Branch, rows.as_slice());
     let mut app = App {
         rows,
-        mode: AppMode::TopLevel { list_state },
-        rx,
+        mode,
         last_area: Rect::default(),
         pending_mode: None,
     };
@@ -218,13 +180,6 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-/// Minimum display width for middle elision (`a…b`); below this, use prefix-only [`truncate_to_width`].
-const MIN_MIDDLE_ELISION_WIDTH: u16 = 5;
-
-fn display_width_str(s: &str) -> usize {
-    s.width()
-}
-
 /// One visual line, truncated to `max_width` display columns (prefix + U+2026 when cut).
 fn truncate_to_width(s: &str, max_width: u16) -> String {
     let max = max_width as usize;
@@ -245,135 +200,6 @@ fn truncate_to_width(s: &str, max_width: u16) -> String {
         out.push(ch);
     }
     out
-}
-
-/// Pad on the right with ASCII spaces until display width is `target_width` (for fixed columns).
-fn pad_right_to_width(s: &str, target_width: u16) -> String {
-    let tw = target_width as usize;
-    let mut out = s.to_string();
-    let mut w = display_width_str(&out);
-    while w < tw {
-        out.push(' ');
-        w += 1;
-    }
-    out
-}
-
-/// Fit `s` into `max_width` display columns: middle elision (`…`) when wide enough, else prefix truncate.
-fn fit_width(s: &str, max_width: u16) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    if display_width_str(s) <= max_width as usize {
-        return s.to_string();
-    }
-    if max_width < MIN_MIDDLE_ELISION_WIDTH {
-        return truncate_to_width(s, max_width);
-    }
-    elide_middle(s, max_width)
-}
-
-/// `left…right` by display width; falls back to [`truncate_to_width`] if pieces would overlap.
-fn elide_middle(s: &str, max_width: u16) -> String {
-    let w = max_width as usize;
-    let sw = display_width_str(s);
-    if sw <= w {
-        return s.to_string();
-    }
-    const ELL: char = '…';
-    let ell_w = UnicodeWidthChar::width(ELL).unwrap_or(1);
-    if w <= ell_w {
-        return truncate_to_width(s, max_width);
-    }
-    let inner = w - ell_w;
-    let left_w = inner / 2;
-    let right_w = inner - left_w;
-
-    let chars: Vec<char> = s.chars().collect();
-    let mut acc = 0usize;
-    let mut left_end = 0usize;
-    for (i, ch) in chars.iter().enumerate() {
-        let cw = UnicodeWidthChar::width(*ch).unwrap_or(0);
-        if acc + cw > left_w {
-            break;
-        }
-        acc += cw;
-        left_end = i + 1;
-    }
-    let mut acc = 0usize;
-    let mut right_start = chars.len();
-    for i in (0..chars.len()).rev() {
-        let ch = chars[i];
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if acc + cw > right_w {
-            break;
-        }
-        acc += cw;
-        right_start = i;
-    }
-    if left_end >= right_start {
-        return truncate_to_width(s, max_width);
-    }
-    let left: String = chars[..left_end].iter().collect();
-    let right: String = chars[right_start..].iter().collect();
-    format!("{}{}{}", left, ELL, right)
-}
-
-/// Two-char status prefix, then elided name, space, elided branch/status text.
-fn format_top_level_row(row: &Row, content_w: u16) -> String {
-    let status = match row {
-        Row::Scanning { .. } => "% ",
-        Row::NotGit { .. } => "! ",
-        Row::Git { dirty, .. } => {
-            if *dirty {
-                "* "
-            } else {
-                "  "
-            }
-        }
-    };
-    let (name_src, branch_src) = match row {
-        Row::Scanning { name, .. } => (name.as_str(), "<scanning>"),
-        Row::NotGit { name, .. } => (name.as_str(), "<not-git>"),
-        Row::Git {
-            name,
-            branch_label,
-            ..
-        } => (name.as_str(), branch_label.as_str()),
-    };
-
-    // After 2-char status: name + one space + branch; total display width = content_w.
-    let usable = content_w.saturating_sub(2);
-    if usable < 1 {
-        return truncate_to_width(
-            &format!("{}{}", status, name_src),
-            content_w,
-        );
-    }
-    // `inner` = display width for name + branch (one space gap is inside `usable`).
-    let inner = usable.saturating_sub(1);
-    if inner == 0 {
-        return truncate_to_width(
-            &format!("{}{}", status, name_src),
-            content_w,
-        );
-    }
-    let name_max = ((inner as u32 * 60 / 100) as u16)
-        .max(1)
-        .min(inner.saturating_sub(1).max(1));
-    let branch_max = inner.saturating_sub(name_max);
-    let name_fit = fit_width(name_src, name_max);
-    let name_padded = pad_right_to_width(&name_fit, name_max);
-    let branch_fit = if branch_max == 0 {
-        String::new()
-    } else {
-        fit_width(branch_src, branch_max)
-    };
-    if branch_fit.is_empty() {
-        format!("{}{}", status, name_padded)
-    } else {
-        format!("{}{} {}", status, name_padded, branch_fit)
-    }
 }
 
 fn truncate_lines(s: &str, max_width: u16) -> String {
@@ -450,13 +276,6 @@ fn run_app(
 ) -> io::Result<RunOutcome> {
     let mut needs_draw = true;
     loop {
-        while let Ok((idx, row)) = app.rx.try_recv() {
-            if idx < app.rows.len() {
-                app.rows[idx] = row;
-                needs_draw = true;
-            }
-        }
-
         if needs_draw {
             terminal.draw(|frame| {
                 let area = frame.area();
@@ -487,36 +306,12 @@ fn run_app(
                 let App {
                     mode,
                     rows,
-                    rx: _,
                     last_area,
                     pending_mode,
                 } = app;
                 let status_viewport = status_scroll_viewport_lines_disjoint(*last_area);
 
                 match mode {
-                AppMode::TopLevel { list_state } => {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(RunOutcome::Quit),
-                        KeyCode::Up => {
-                            move_selection(list_state, rows.len(), -1);
-                        }
-                        KeyCode::Down => {
-                            move_selection(list_state, rows.len(), 1);
-                        }
-                        KeyCode::Enter => {
-                            let Some(i) = list_state.selected() else {
-                                continue;
-                            };
-                            match &rows[i] {
-                                Row::Scanning { .. } | Row::NotGit { .. } => {}
-                                Row::Git { .. } => {
-                                    *mode = load_repo_detail(i, FocusField::Branch, rows.as_slice());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
                 AppMode::RepoDetail {
                     repo_idx,
                     focus,
@@ -560,10 +355,10 @@ fn run_app(
                                 alt_status_handled = true;
                             }
                             KeyCode::Char('r') | KeyCode::Char('R') if shift => {
-                                if let Some(true) = rows.get(*repo_idx).map(|r| match r {
-                                    Row::Git { dirty, .. } => *dirty,
-                                    _ => false,
-                                }) {
+                                if let Some(Row::Git {
+                                    dirty: true, ..
+                                }) = rows.get(*repo_idx)
+                                {
                                     *pending_mode = Some(AppMode::ConfirmReset {
                                         repo_idx: *repo_idx,
                                     });
@@ -681,12 +476,8 @@ fn run_app(
                                         }
                                         Ok(true) => {
                                             let on_main = rows.get(*repo_idx).map_or(false, |r| {
-                                                match r {
-                                                    Row::Git { branch_label, .. } => {
-                                                        branch_label == "main"
-                                                    }
-                                                    _ => false,
-                                                }
+                                                let Row::Git { branch_label, .. } = r;
+                                                branch_label == "main"
                                             });
                                             if on_main {
                                                 *pending_mode = Some(AppMode::ConfirmCommitMain {
@@ -729,23 +520,20 @@ fn run_app(
                     if !alt_status_handled && !alt_branch_handled {
                         match key.code {
                         KeyCode::Esc => {
-                            *pending_mode = Some(AppMode::TopLevel {
-                                list_state: top_level_state_from_idx(*repo_idx),
-                            });
+                            return Ok(RunOutcome::Quit);
                         }
                         KeyCode::Left => {
                             let prev_focus = *focus;
                             *focus = focus.prev();
                             if prev_focus != FocusField::Branch && *focus == FocusField::Branch {
                                 if let Some(r) = rows.get(*repo_idx) {
-                                    if let Row::Git { branch_label, .. } = r {
-                                        sync_filtered_selection_from_head(
-                                            branch_label,
-                                            branches,
-                                            filter,
-                                            branch_list_state,
-                                        );
-                                    }
+                                    let Row::Git { branch_label, .. } = r;
+                                    sync_filtered_selection_from_head(
+                                        branch_label,
+                                        branches,
+                                        filter,
+                                        branch_list_state,
+                                    );
                                 }
                             }
                         }
@@ -754,14 +542,13 @@ fn run_app(
                             *focus = focus.next();
                             if prev_focus != FocusField::Branch && *focus == FocusField::Branch {
                                 if let Some(r) = rows.get(*repo_idx) {
-                                    if let Row::Git { branch_label, .. } = r {
-                                        sync_filtered_selection_from_head(
-                                            branch_label,
-                                            branches,
-                                            filter,
-                                            branch_list_state,
-                                        );
-                                    }
+                                    let Row::Git { branch_label, .. } = r;
+                                    sync_filtered_selection_from_head(
+                                        branch_label,
+                                        branches,
+                                        filter,
+                                        branch_list_state,
+                                    );
                                 }
                             }
                         }
@@ -769,9 +556,7 @@ fn run_app(
                             let idx = *repo_idx;
                             let row = rows.get(idx).cloned();
                             let Some(row) = row else { continue };
-                            let Row::Git { path, .. } = row else {
-                                continue;
-                            };
+                            let Row::Git { path, .. } = row;
                             match *focus {
                                 FocusField::Branch => {
                                     if nf == 0 {
@@ -792,14 +577,13 @@ fn run_app(
                                     *branches = list_branches(&path).unwrap_or_default();
                                     filter.clear();
                                     if let Some(r) = rows.get(idx) {
-                                        if let Row::Git { branch_label, .. } = r {
-                                            sync_filtered_selection_from_head(
-                                                branch_label,
-                                                branches,
-                                                filter,
-                                                branch_list_state,
-                                            );
-                                        }
+                                        let Row::Git { branch_label, .. } = r;
+                                        sync_filtered_selection_from_head(
+                                            branch_label,
+                                            branches,
+                                            filter,
+                                            branch_list_state,
+                                        );
                                     }
                                 }
                                 FocusField::Status => {}
@@ -1100,45 +884,15 @@ fn run_app(
     }
 }
 
-fn top_level_state_from_idx(idx: usize) -> ListState {
-    let mut s = ListState::default();
-    s.select(Some(idx));
-    s
-}
-
-fn move_selection(list_state: &mut ListState, len: usize, delta: i32) {
-    if len == 0 {
-        return;
-    }
-    let i = list_state.selected().unwrap_or(0);
-    let new_i = if delta < 0 {
-        if i == 0 {
-            len - 1
-        } else {
-            i - 1
-        }
-    } else if i >= len - 1 {
-        0
-    } else {
-        i + 1
-    };
-    list_state.select(Some(new_i));
-}
-
 impl Row {
     fn path(&self) -> Option<&Path> {
         match self {
-            Row::Scanning { path, .. } | Row::NotGit { path, .. } | Row::Git { path, .. } => {
-                Some(path.as_path())
-            }
+            Row::Git { path, .. } => Some(path.as_path()),
         }
     }
 }
 
 fn probe_repo(name: String, path: PathBuf) -> Row {
-    if !is_git_repo(&path) {
-        return Row::NotGit { name, path };
-    }
     let branch_label = match branch_display(&path) {
         Ok(s) => s,
         Err(_) => "<error>".to_string(),
@@ -1153,27 +907,20 @@ fn probe_repo(name: String, path: PathBuf) -> Row {
 }
 
 fn refresh_git_row(row: &Row) -> io::Result<Row> {
-    match row {
-        Row::Git {
-            name,
-            path,
-            branch_label: _,
-            dirty: _,
-        } => {
-            let branch_label = branch_display(path).unwrap_or_else(|_| "<error>".to_string());
-            let dirty = is_dirty(path).unwrap_or(false);
-            Ok(Row::Git {
-                name: name.clone(),
-                path: path.clone(),
-                branch_label,
-                dirty,
-            })
-        }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a git row",
-        )),
-    }
+    let Row::Git {
+        name,
+        path,
+        branch_label: _,
+        dirty: _,
+    } = row;
+    let branch_label = branch_display(path).unwrap_or_else(|_| "<error>".to_string());
+    let dirty = is_dirty(path).unwrap_or(false);
+    Ok(Row::Git {
+        name: name.clone(),
+        path: path.clone(),
+        branch_label,
+        dirty,
+    })
 }
 
 fn is_git_repo(path: &Path) -> bool {
@@ -1402,6 +1149,14 @@ fn index_of_current_branch(branch_label: &str, branches: &[String]) -> Option<us
     branches.iter().position(|b| b == branch_label)
 }
 
+/// `* ` marks HEAD; two spaces keep branch names aligned with the highlight column.
+fn format_branch_list_line(branch_name: &str, branch_label: &str, content_width: u16) -> String {
+    let is_head = !branch_label.starts_with("<detached") && branch_name == branch_label;
+    let prefix = if is_head { "* " } else { "  " };
+    let line = format!("{prefix}{branch_name}");
+    truncate_to_width(&line, content_width)
+}
+
 fn sync_branch_list_to_head(
     branch_label: &str,
     branches: &[String],
@@ -1465,9 +1220,8 @@ fn load_repo_detail(repo_idx: usize, focus: FocusField, rows: &[Row]) -> AppMode
     let filter = String::new();
     let mut branch_list_state = ListState::default();
     if let Some(r) = rows.get(repo_idx) {
-        if let Row::Git { branch_label, .. } = r {
-            sync_filtered_selection_from_head(branch_label, &branches, &filter, &mut branch_list_state);
-        }
+        let Row::Git { branch_label, .. } = r;
+        sync_filtered_selection_from_head(branch_label, &branches, &filter, &mut branch_list_state);
     }
     AppMode::RepoDetail {
         repo_idx,
@@ -1507,7 +1261,6 @@ fn git_stash(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Initial commit message: `git rev-parse --abbrev-ref HEAD`.
 /// `true` if something is staged for commit (`git diff --cached` is non-empty).
 fn has_staged_changes(repo: &Path) -> io::Result<bool> {
     let s = Command::new("git")
@@ -1525,29 +1278,55 @@ fn has_staged_changes(repo: &Path) -> io::Result<bool> {
     }
 }
 
-fn commit_message_from_head(repo: &Path) -> io::Result<String> {
-    let o = git_c(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if !o.status.success() {
-        return Err(io::Error::other("git rev-parse --abbrev-ref HEAD failed"));
-    }
-    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-    if s.is_empty() {
-        return Err(io::Error::other("empty branch ref"));
-    }
-    Ok(s)
+/// Standard Git comment block (we set `commit.status=false` so Git does not add its own).
+const COMMIT_EDITOR_HELP: &str = r#"# Please enter the commit message for your changes. Lines starting
+# with '#' will be ignored, and an empty message aborts the commit.
+#
+"#;
+
+/// Prefix each line of `git diff` output with `# ` for the commit message buffer.
+fn comment_diff_lines(diff: &str) -> String {
+    diff.lines()
+        .map(|line| format!("# {line}\n"))
+        .collect()
 }
 
-/// `git commit -e -m <msg>` with `<msg>` from [`commit_message_from_head`], then the editor opens.
+/// Builds the initial `git commit -e -m` text: help block, `# <branch>`, then commented `git diff` output.
+fn build_commit_initial_message(repo: &Path) -> io::Result<String> {
+    let branch_o = git_c(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if !branch_o.status.success() {
+        return Err(io::Error::other("git rev-parse --abbrev-ref HEAD failed"));
+    }
+    let branch = String::from_utf8_lossy(&branch_o.stdout).trim().to_string();
+    if branch.is_empty() {
+        return Err(io::Error::other("empty branch ref"));
+    }
+
+    let diff_o = git_c(repo, &["--no-pager", "diff", "--cached"])?;
+    if !diff_o.status.success() {
+        return Err(io::Error::other("git diff failed"));
+    }
+    let diff_raw = String::from_utf8_lossy(&diff_o.stdout);
+    let diff_commented = comment_diff_lines(&diff_raw);
+
+    Ok(format!(
+        "{COMMIT_EDITOR_HELP}# {branch}\n{diff_commented}"
+    ))
+}
+
+/// `git commit -c commit.status=false -e -m <msg>` with `<msg>` from [`build_commit_initial_message`].
 fn git_commit_with_message_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     repo: &Path,
 ) -> io::Result<()> {
-    let msg = commit_message_from_head(repo)?;
+    let msg = build_commit_initial_message(repo)?;
     let repo = repo.to_path_buf();
     suspend_tui_run_external(terminal, move || {
         let s = Command::new("git")
             .arg("-C")
             .arg(&repo)
+            .arg("-c")
+            .arg("commit.status=false")
             .args(["commit", "-e", "-m", &msg])
             .status()?;
         if !s.success() {
@@ -1677,7 +1456,6 @@ fn suspend_tui_run_external(
 
 fn draw(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     match &mut app.mode {
-        AppMode::TopLevel { list_state } => draw_top_level(frame, area, &app.rows, list_state),
         AppMode::RepoDetail {
             repo_idx,
             focus,
@@ -1724,35 +1502,6 @@ fn draw(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
-fn draw_top_level(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    rows: &[Row],
-    list_state: &mut ListState,
-) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("git interactive repos");
-    let inner = block.inner(area);
-    // One column for `>` highlight prefix; content holds status + name + branch.
-    let content_w = inner.width.saturating_sub(1).max(1);
-
-    let items: Vec<ListItem> = rows
-        .iter()
-        .map(|row| {
-            let line = format_top_level_row(row, content_w);
-            ListItem::new(truncate_to_width(&line, content_w))
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol(">");
-
-    frame.render_stateful_widget(list, area, list_state);
-}
-
 fn draw_repo_detail(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1773,10 +1522,7 @@ fn draw_repo_detail(
         path,
         branch_label,
         ..
-    } = row
-    else {
-        return;
-    };
+    } = row;
 
     let status_porcelain = git_status_porcelain(path).unwrap_or_else(|_| "<error>".to_string());
 
@@ -1831,7 +1577,9 @@ fn draw_repo_detail(
         }
         filtered
             .iter()
-            .map(|b| ListItem::new(truncate_to_width(b.as_str(), text_w)))
+            .map(|b| {
+                ListItem::new(format_branch_list_line(b.as_str(), branch_label, text_w))
+            })
             .collect()
     } else {
         sync_branch_list_to_head(branch_label, branches, branch_list_state);
@@ -1844,7 +1592,9 @@ fn draw_repo_detail(
         }
         branches
             .iter()
-            .map(|b| ListItem::new(truncate_to_width(b.as_str(), text_w)))
+            .map(|b| {
+                ListItem::new(format_branch_list_line(b.as_str(), branch_label, text_w))
+            })
             .collect()
     };
 
@@ -1911,9 +1661,9 @@ fn draw_repo_detail(
 fn draw_confirm_reset(frame: &mut Frame<'_>, area: Rect, rows: &[Row], repo_idx: usize) {
     let name = rows
         .get(repo_idx)
-        .map(|r| match r {
-            Row::Git { name, .. } => name.as_str(),
-            _ => "?",
+        .map(|r| {
+            let Row::Git { name, .. } = r;
+            name.as_str()
         })
         .unwrap_or("?");
     let text = format!(
@@ -1937,9 +1687,9 @@ fn draw_confirm_file_reset(
 ) {
     let name = rows
         .get(repo_idx)
-        .map(|r| match r {
-            Row::Git { name, .. } => name.as_str(),
-            _ => "?",
+        .map(|r| {
+            let Row::Git { name, .. } = r;
+            name.as_str()
         })
         .unwrap_or("?");
     let text = format!(
@@ -1957,15 +1707,16 @@ fn draw_confirm_file_reset(
 fn draw_confirm_commit_main(frame: &mut Frame<'_>, area: Rect, rows: &[Row], repo_idx: usize) {
     let name = rows
         .get(repo_idx)
-        .map(|r| match r {
-            Row::Git { name, .. } => name.as_str(),
-            _ => "?",
+        .map(|r| {
+            let Row::Git { name, .. } = r;
+            name.as_str()
         })
         .unwrap_or("?");
     let text = format!(
         "You are on branch main. Committing directly to main is often discouraged.\n\n\
-         Proceed? The editor will open with the message preset to the branch name\n\
-         (git rev-parse --abbrev-ref HEAD), same as: git commit -e -m \"…\"\n\n\
+         Proceed? The editor opens with a template: Git's default status block is off\n\
+         (commit.status=false); you get a short help comment, `# main`, then `git diff` with each line commented.\n\
+         Add your real message above or among those lines; all-comment aborts.\n\n\
          Repo: {}\n\n\
          Enter = continue   Esc = cancel",
         name
@@ -1986,9 +1737,9 @@ fn draw_nothing_staged_warning(
 ) {
     let name = rows
         .get(repo_idx)
-        .map(|r| match r {
-            Row::Git { name, .. } => name.as_str(),
-            _ => "?",
+        .map(|r| {
+            let Row::Git { name, .. } = r;
+            name.as_str()
         })
         .unwrap_or("?");
     let text = format!(
@@ -2033,9 +1784,9 @@ fn draw_gitignore_edit(
 ) {
     let name = rows
         .get(repo_idx)
-        .map(|r| match r {
-            Row::Git { name, .. } => name.as_str(),
-            _ => "?",
+        .map(|r| {
+            let Row::Git { name, .. } = r;
+            name.as_str()
         })
         .unwrap_or("?");
     let block = Block::default()
@@ -2060,9 +1811,9 @@ fn draw_branch_create_edit(
 ) {
     let name = rows
         .get(repo_idx)
-        .map(|r| match r {
-            Row::Git { name, .. } => name.as_str(),
-            _ => "?",
+        .map(|r| {
+            let Row::Git { name, .. } = r;
+            name.as_str()
         })
         .unwrap_or("?");
     let block = Block::default()
@@ -2080,9 +1831,9 @@ fn draw_branch_create_edit(
 fn draw_status_help(frame: &mut Frame<'_>, area: Rect, rows: &[Row], repo_idx: usize) {
     let name = rows
         .get(repo_idx)
-        .map(|r| match r {
-            Row::Git { name, .. } => name.as_str(),
-            _ => "?",
+        .map(|r| {
+            let Row::Git { name, .. } = r;
+            name.as_str()
         })
         .unwrap_or("?");
     let text = format!(
@@ -2096,7 +1847,7 @@ fn draw_status_help(frame: &mut Frame<'_>, area: Rect, rows: &[Row], repo_idx: u
          Alt+i     add pattern to .gitignore\n\
          Alt+s     git stash push\n\
          Alt+p     git stash pop\n\
-         Alt+c     commit (staged only; else warning)\n\n\
+         Alt+c     commit (staged; template + commented diff; commit.status=false)\n\n\
          Esc or q  dismiss",
         name
     );
