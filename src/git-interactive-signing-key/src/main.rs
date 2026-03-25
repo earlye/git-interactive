@@ -1,5 +1,5 @@
 use std::io::{self, stdout};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use clap::Parser;
 use crossterm::{
@@ -90,6 +90,10 @@ fn set_signing_key(key_id: &str, global: bool) -> io::Result<()> {
         cmd.arg("--global");
     }
     cmd.args(["user.signingkey", key_id]);
+    // `status()` inherits stderr by default; git could print into the TUI (see repo AGENTS.md).
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     let status = cmd.status()?;
     if !status.success() {
@@ -187,7 +191,7 @@ fn run_app(
         if let Event::Key(key) = event::read()? {
             if key.kind == KeyEventKind::Press {
                 match key.code {
-                    KeyCode::Char('q') => return Ok(None),
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
                     KeyCode::Char('c')
                         if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                     {

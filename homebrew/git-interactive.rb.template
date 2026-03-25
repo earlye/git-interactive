@@ -18,6 +18,7 @@ class GitInteractive < Formula
   def install
     bin.install "git-interactive"
     bin.install "git-interactive-signing-key"
+    bin.install "git-interactive-repos"
   end
 
   test do
