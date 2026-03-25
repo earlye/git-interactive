@@ -72,12 +72,14 @@ enum AppMode {
     RepoDetail {
         repo_idx: usize,
         focus: FocusField,
-    },
-    BranchSelect {
-        repo_idx: usize,
-        filter: String,
         branches: Vec<String>,
-        list_state: ListState,
+        /// Substring filter (case-insensitive); only applied while `focus == Branch`.
+        filter: String,
+        branch_list_state: ListState,
+        /// First visible line of porcelain in the status panel (viewport offset).
+        status_scroll: usize,
+        /// Selected line index in full `git status --porcelain` output (like branch list).
+        status_selected_line: usize,
     },
     ConfirmReset {
         repo_idx: usize,
@@ -89,6 +91,8 @@ struct App {
     mode: AppMode,
     /// Updates from background probes: (index, new row).
     rx: mpsc::Receiver<(usize, Row)>,
+    /// Last `frame.area()` from [`Terminal::draw`], for status scroll viewport math.
+    last_area: Rect,
 }
 
 #[derive(Clone)]
@@ -160,6 +164,7 @@ fn main() -> io::Result<()> {
         rows,
         mode: AppMode::TopLevel { list_state },
         rx,
+        last_area: Rect::default(),
     };
 
     enable_raw_mode()?;
@@ -347,6 +352,67 @@ fn truncate_lines(s: &str, max_width: u16) -> String {
         .join("\n")
 }
 
+/// Inner line count for the status panel: horizontal layout chunk height equals `area.height`; block removes two border rows.
+fn status_viewport_lines(area_height: u16) -> usize {
+    (area_height as usize).saturating_sub(2).max(1)
+}
+
+fn status_scroll_viewport_lines(app: &App) -> usize {
+    let h = if app.last_area.height > 0 {
+        app.last_area.height
+    } else {
+        crossterm::terminal::size()
+            .map(|(_, h)| h)
+            .unwrap_or(24)
+    };
+    status_viewport_lines(h)
+}
+
+fn status_max_scroll(total_lines: usize, viewport_lines: usize) -> usize {
+    total_lines.saturating_sub(viewport_lines)
+}
+
+fn status_selection_move_up(sel: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    if sel == 0 {
+        total - 1
+    } else {
+        sel - 1
+    }
+}
+
+fn status_selection_move_down(sel: usize, total: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    if sel >= total - 1 {
+        0
+    } else {
+        sel + 1
+    }
+}
+
+fn ensure_status_scroll_visible(
+    scroll: &mut usize,
+    selected: usize,
+    viewport: usize,
+    total: usize,
+) {
+    if total == 0 || viewport == 0 {
+        *scroll = 0;
+        return;
+    }
+    let max_scroll = status_max_scroll(total, viewport);
+    if selected < *scroll {
+        *scroll = selected;
+    } else if selected >= (*scroll).saturating_add(viewport) {
+        *scroll = selected + 1 - viewport;
+    }
+    *scroll = (*scroll).min(max_scroll);
+}
+
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -363,6 +429,7 @@ fn run_app(
         if needs_draw {
             terminal.draw(|frame| {
                 let area = frame.area();
+                app.last_area = area;
                 draw(frame, area, app);
             })?;
             needs_draw = false;
@@ -386,6 +453,8 @@ fn run_app(
                     return Ok(RunOutcome::Quit);
                 }
 
+                let status_viewport = status_scroll_viewport_lines(app);
+
                 match &mut app.mode {
                 AppMode::TopLevel { list_state } => {
                     match key.code {
@@ -403,17 +472,30 @@ fn run_app(
                             match &app.rows[i] {
                                 Row::Scanning { .. } | Row::NotGit { .. } => {}
                                 Row::Git { .. } => {
-                                    app.mode = AppMode::RepoDetail {
-                                        repo_idx: i,
-                                        focus: FocusField::Branch,
-                                    };
+                                    app.mode = load_repo_detail(i, FocusField::Branch, &app.rows);
                                 }
                             }
                         }
                         _ => {}
                     }
                 }
-                AppMode::RepoDetail { repo_idx, focus } => {
+                AppMode::RepoDetail {
+                    repo_idx,
+                    focus,
+                    branches,
+                    filter,
+                    branch_list_state,
+                    status_scroll,
+                    status_selected_line,
+                } => {
+                    let filtered_indices: Vec<usize> = branches
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, b)| branch_matches_filter(b, filter))
+                        .map(|(i, _)| i)
+                        .collect();
+                    let nf = filtered_indices.len();
+
                     match key.code {
                         KeyCode::Esc => {
                             app.mode = AppMode::TopLevel {
@@ -421,10 +503,36 @@ fn run_app(
                             };
                         }
                         KeyCode::Left | KeyCode::Char('h') => {
+                            let prev_focus = *focus;
                             *focus = focus.prev();
+                            if prev_focus != FocusField::Branch && *focus == FocusField::Branch {
+                                if let Some(r) = app.rows.get(*repo_idx) {
+                                    if let Row::Git { branch_label, .. } = r {
+                                        sync_filtered_selection_from_head(
+                                            branch_label,
+                                            branches,
+                                            filter,
+                                            branch_list_state,
+                                        );
+                                    }
+                                }
+                            }
                         }
                         KeyCode::Right | KeyCode::Char('l') => {
+                            let prev_focus = *focus;
                             *focus = focus.next();
+                            if prev_focus != FocusField::Branch && *focus == FocusField::Branch {
+                                if let Some(r) = app.rows.get(*repo_idx) {
+                                    if let Row::Git { branch_label, .. } = r {
+                                        sync_filtered_selection_from_head(
+                                            branch_label,
+                                            branches,
+                                            filter,
+                                            branch_list_state,
+                                        );
+                                    }
+                                }
+                            }
                         }
                         KeyCode::Enter => {
                             let idx = *repo_idx;
@@ -435,19 +543,32 @@ fn run_app(
                             };
                             match *focus {
                                 FocusField::Branch => {
-                                    match list_branches(&path) {
-                                        Ok(branches) if branches.is_empty() => {}
-                                        Ok(branches) => {
-                                            let mut list_state = ListState::default();
-                                            list_state.select(Some(0));
-                                            app.mode = AppMode::BranchSelect {
-                                                repo_idx: idx,
-                                                filter: String::new(),
-                                                branches,
-                                                list_state,
-                                            };
+                                    if nf == 0 {
+                                        continue;
+                                    }
+                                    let sel = branch_list_state
+                                        .selected()
+                                        .unwrap_or(0)
+                                        .min(nf - 1);
+                                    let branch_idx = filtered_indices[sel];
+                                    let branch_name = branches[branch_idx].clone();
+                                    let _ = git_switch(&path, &branch_name);
+                                    if let Some(r) = app.rows.get_mut(idx) {
+                                        if let Ok(new_row) = refresh_git_row(r) {
+                                            *r = new_row;
                                         }
-                                        Err(_) => {}
+                                    }
+                                    *branches = list_branches(&path).unwrap_or_default();
+                                    filter.clear();
+                                    if let Some(r) = app.rows.get(idx) {
+                                        if let Row::Git { branch_label, .. } = r {
+                                            sync_filtered_selection_from_head(
+                                                branch_label,
+                                                branches,
+                                                filter,
+                                                branch_list_state,
+                                            );
+                                        }
                                     }
                                 }
                                 FocusField::Status => {
@@ -465,79 +586,73 @@ fn run_app(
                                 }
                             }
                         }
-                        _ => {}
-                    }
-                }
-                AppMode::BranchSelect {
-                    repo_idx,
-                    filter,
-                    branches,
-                    list_state,
-                } => {
-                    let filtered: Vec<usize> = branches
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, b)| branch_matches_filter(b, filter))
-                        .map(|(i, _)| i)
-                        .collect();
-
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.mode = AppMode::RepoDetail {
-                                repo_idx: *repo_idx,
-                                focus: FocusField::Branch,
-                            };
-                        }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            let nf = filtered.len();
-                            if nf > 0 {
-                                let sel = list_state.selected().unwrap_or(0).min(nf - 1);
+                            if *focus == FocusField::Branch && nf > 0 {
+                                let sel = branch_list_state
+                                    .selected()
+                                    .unwrap_or(0)
+                                    .min(nf - 1);
                                 let new_sel = if sel == 0 { nf - 1 } else { sel - 1 };
-                                list_state.select(Some(new_sel));
+                                branch_list_state.select(Some(new_sel));
+                            } else if *focus == FocusField::Status {
+                                if let Some(path) = app.rows.get(*repo_idx).and_then(|r| r.path()) {
+                                    let total = git_status_porcelain(path)
+                                        .map(|s| s.lines().count())
+                                        .unwrap_or(0);
+                                    if total > 0 {
+                                        *status_selected_line =
+                                            status_selection_move_up(*status_selected_line, total);
+                                        ensure_status_scroll_visible(
+                                            status_scroll,
+                                            *status_selected_line,
+                                            status_viewport,
+                                            total,
+                                        );
+                                    }
+                                }
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            let nf = filtered.len();
-                            if nf > 0 {
-                                let sel = list_state.selected().unwrap_or(0).min(nf - 1);
+                            if *focus == FocusField::Branch && nf > 0 {
+                                let sel = branch_list_state
+                                    .selected()
+                                    .unwrap_or(0)
+                                    .min(nf - 1);
                                 let new_sel = if sel >= nf - 1 { 0 } else { sel + 1 };
-                                list_state.select(Some(new_sel));
-                            }
-                        }
-                        KeyCode::Enter => {
-                            let nf = filtered.len();
-                            if nf == 0 {
-                                continue;
-                            }
-                            let sel = list_state.selected().unwrap_or(0).min(nf - 1);
-                            let branch_idx = filtered[sel];
-                            let branch_name = branches[branch_idx].clone();
-                            let path = app.rows[*repo_idx]
-                                .path()
-                                .expect("repo row")
-                                .to_path_buf();
-                            let _ = git_switch(&path, &branch_name);
-                            if let Some(r) = app.rows.get_mut(*repo_idx) {
-                                if let Ok(new_row) = refresh_git_row(r) {
-                                    *r = new_row;
+                                branch_list_state.select(Some(new_sel));
+                            } else if *focus == FocusField::Status {
+                                if let Some(path) = app.rows.get(*repo_idx).and_then(|r| r.path()) {
+                                    let total = git_status_porcelain(path)
+                                        .map(|s| s.lines().count())
+                                        .unwrap_or(0);
+                                    if total > 0 {
+                                        *status_selected_line =
+                                            status_selection_move_down(*status_selected_line, total);
+                                        ensure_status_scroll_visible(
+                                            status_scroll,
+                                            *status_selected_line,
+                                            status_viewport,
+                                            total,
+                                        );
+                                    }
                                 }
                             }
-                            app.mode = AppMode::RepoDetail {
-                                repo_idx: *repo_idx,
-                                focus: FocusField::Branch,
-                            };
                         }
                         KeyCode::Backspace => {
-                            filter.pop();
-                            list_state.select(Some(0));
+                            if *focus == FocusField::Branch {
+                                filter.pop();
+                                branch_list_state.select(Some(0));
+                            }
                         }
                         KeyCode::Char(c)
                             if !key
                                 .modifiers
                                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                         {
-                            filter.push(c);
-                            list_state.select(Some(0));
+                            if *focus == FocusField::Branch {
+                                filter.push(c);
+                                branch_list_state.select(Some(0));
+                            }
                         }
                         _ => {}
                     }
@@ -545,10 +660,7 @@ fn run_app(
                 AppMode::ConfirmReset { repo_idx } => {
                     match key.code {
                         KeyCode::Esc => {
-                            app.mode = AppMode::RepoDetail {
-                                repo_idx: *repo_idx,
-                                focus: FocusField::Status,
-                            };
+                            app.mode = load_repo_detail(*repo_idx, FocusField::Status, &app.rows);
                         }
                         KeyCode::Enter => {
                             let path = app.rows[*repo_idx]
@@ -561,10 +673,7 @@ fn run_app(
                                     *r = new_row;
                                 }
                             }
-                            app.mode = AppMode::RepoDetail {
-                                repo_idx: *repo_idx,
-                                focus: FocusField::Status,
-                            };
+                            app.mode = load_repo_detail(*repo_idx, FocusField::Status, &app.rows);
                         }
                         _ => {}
                     }
@@ -730,6 +839,17 @@ fn is_dirty(path: &Path) -> io::Result<bool> {
     Ok(!o.stdout.is_empty())
 }
 
+/// Raw `git status --porcelain` output (may be empty when clean).
+fn git_status_porcelain(path: &Path) -> io::Result<String> {
+    let o = git_c(path, &["status", "--porcelain"])?;
+    if !o.status.success() {
+        return Err(io::Error::other(
+            "git status failed",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&o.stdout).to_string())
+}
+
 fn list_branches(path: &Path) -> io::Result<Vec<String>> {
     let o = git_c(
         path,
@@ -757,12 +877,89 @@ fn list_branches(path: &Path) -> io::Result<Vec<String>> {
     Ok(seen.into_iter().collect())
 }
 
+fn index_of_current_branch(branch_label: &str, branches: &[String]) -> Option<usize> {
+    if branch_label.starts_with("<detached") {
+        return None;
+    }
+    branches.iter().position(|b| b == branch_label)
+}
+
+fn sync_branch_list_to_head(
+    branch_label: &str,
+    branches: &[String],
+    branch_list_state: &mut ListState,
+) {
+    if branches.is_empty() {
+        branch_list_state.select(None);
+        return;
+    }
+    match index_of_current_branch(branch_label, branches) {
+        Some(i) => branch_list_state.select(Some(i)),
+        None => branch_list_state.select(None),
+    }
+}
+
 fn branch_matches_filter(branch: &str, filter: &str) -> bool {
     if filter.is_empty() {
         return true;
     }
     let f = filter.to_lowercase();
     branch.to_lowercase().contains(f.as_str())
+}
+
+fn filtered_branch_indices(branches: &[String], filter: &str) -> Vec<usize> {
+    branches
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| branch_matches_filter(b, filter))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Sets `branch_list_state` to the **filtered** row index for the current HEAD (or `0` / none).
+fn sync_filtered_selection_from_head(
+    branch_label: &str,
+    branches: &[String],
+    filter: &str,
+    branch_list_state: &mut ListState,
+) {
+    let filtered = filtered_branch_indices(branches, filter);
+    let nf = filtered.len();
+    if nf == 0 {
+        branch_list_state.select(None);
+        return;
+    }
+    if let Some(head_i) = index_of_current_branch(branch_label, branches) {
+        if let Some(pos) = filtered.iter().position(|&bi| bi == head_i) {
+            branch_list_state.select(Some(pos));
+            return;
+        }
+    }
+    branch_list_state.select(Some(0));
+}
+
+fn load_repo_detail(repo_idx: usize, focus: FocusField, rows: &[Row]) -> AppMode {
+    let branches = rows
+        .get(repo_idx)
+        .and_then(|r| r.path())
+        .map(|p| list_branches(p).unwrap_or_default())
+        .unwrap_or_default();
+    let filter = String::new();
+    let mut branch_list_state = ListState::default();
+    if let Some(r) = rows.get(repo_idx) {
+        if let Row::Git { branch_label, .. } = r {
+            sync_filtered_selection_from_head(branch_label, &branches, &filter, &mut branch_list_state);
+        }
+    }
+    AppMode::RepoDetail {
+        repo_idx,
+        focus,
+        branches,
+        filter,
+        branch_list_state,
+        status_scroll: 0,
+        status_selected_line: 0,
+    }
 }
 
 fn git_switch(path: &Path, branch: &str) -> io::Result<()> {
@@ -802,15 +999,26 @@ fn git_reset_hard_and_clean(path: &Path) -> io::Result<()> {
 fn draw(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     match &mut app.mode {
         AppMode::TopLevel { list_state } => draw_top_level(frame, area, &app.rows, list_state),
-        AppMode::RepoDetail { repo_idx, focus } => {
-            draw_repo_detail(frame, area, &app.rows, *repo_idx, *focus)
-        }
-        AppMode::BranchSelect {
+        AppMode::RepoDetail {
             repo_idx,
-            filter,
+            focus,
             branches,
-            list_state,
-        } => draw_branch_select(frame, area, &app.rows, *repo_idx, filter, branches, list_state),
+            filter,
+            branch_list_state,
+            status_scroll,
+            status_selected_line,
+        } => draw_repo_detail(
+            frame,
+            area,
+            &app.rows,
+            *repo_idx,
+            *focus,
+            branches,
+            filter,
+            branch_list_state,
+            status_scroll,
+            status_selected_line,
+        ),
         AppMode::ConfirmReset { repo_idx } => draw_confirm_reset(frame, area, &app.rows, *repo_idx),
     }
 }
@@ -850,21 +1058,27 @@ fn draw_repo_detail(
     rows: &[Row],
     repo_idx: usize,
     focus: FocusField,
+    branches: &[String],
+    filter: &str,
+    branch_list_state: &mut ListState,
+    status_scroll: &mut usize,
+    status_selected_line: &mut usize,
 ) {
     let Some(row) = rows.get(repo_idx) else {
         return;
     };
     let Row::Git {
         name,
+        path,
         branch_label,
-        dirty,
         ..
     } = row
     else {
         return;
     };
 
-    let status_text = if *dirty { "<dirty>" } else { "" };
+    let status_porcelain = git_status_porcelain(path).unwrap_or_else(|_| "<error>".to_string());
+
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -882,24 +1096,109 @@ fn draw_repo_detail(
         }
     };
 
+    let chunk_w = chunks[0].width.max(1);
+
+    let title_raw = if focus == FocusField::Branch {
+        format!(
+            "branch [{}] — filter: {}",
+            name,
+            if filter.is_empty() {
+                "(type to filter)".to_string()
+            } else {
+                filter.to_string()
+            }
+        )
+    } else {
+        format!("branch [{}]", name)
+    };
+    let title = truncate_to_width(&title_raw, chunk_w.saturating_sub(4).max(1));
+
     let b_branch = Block::default()
         .borders(Borders::ALL)
-        .title("branch")
+        .title(title)
         .border_style(b_style(FocusField::Branch));
-    let tw0 = b_branch.inner(chunks[0]).width.max(1);
-    let p0 = Paragraph::new(format!(
-        "{}\n{}",
-        truncate_to_width(name.as_str(), tw0),
-        truncate_to_width(branch_label.as_str(), tw0)
-    ))
-    .block(b_branch);
+    let inner_branch = b_branch.inner(chunks[0]);
+    let text_w = inner_branch.width.saturating_sub(2).max(1);
+
+    let items: Vec<ListItem> = if focus == FocusField::Branch {
+        let filtered: Vec<&String> = branches
+            .iter()
+            .filter(|b| branch_matches_filter(b, filter))
+            .collect();
+        let nf = filtered.len();
+        if nf == 0 {
+            branch_list_state.select(None);
+        } else {
+            let sel = branch_list_state.selected().unwrap_or(0).min(nf - 1);
+            branch_list_state.select(Some(sel));
+        }
+        filtered
+            .iter()
+            .map(|b| ListItem::new(truncate_to_width(b.as_str(), text_w)))
+            .collect()
+    } else {
+        sync_branch_list_to_head(branch_label, branches, branch_list_state);
+        let n = branches.len();
+        if n > 0 {
+            let sel = branch_list_state.selected().unwrap_or(0).min(n - 1);
+            branch_list_state.select(Some(sel));
+        } else {
+            branch_list_state.select(None);
+        }
+        branches
+            .iter()
+            .map(|b| ListItem::new(truncate_to_width(b.as_str(), text_w)))
+            .collect()
+    };
+
+    let list = List::new(items)
+        .block(b_branch)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+
+    frame.render_stateful_widget(list, chunks[0], branch_list_state);
 
     let b_status = Block::default()
         .borders(Borders::ALL)
         .title("status")
         .border_style(b_style(FocusField::Status));
-    let tw1 = b_status.inner(chunks[1]).width.max(1);
-    let p1 = Paragraph::new(truncate_to_width(status_text, tw1)).block(b_status);
+    let inner_status = b_status.inner(chunks[1]);
+    let tw1 = inner_status.width.max(1);
+    let viewport = inner_status.height.max(1) as usize;
+    let status_lines_vec: Vec<&str> = status_porcelain.lines().collect();
+    let total_lines = status_lines_vec.len();
+    if total_lines == 0 {
+        *status_selected_line = 0;
+        *status_scroll = 0;
+    } else {
+        *status_selected_line = (*status_selected_line).min(total_lines - 1);
+        ensure_status_scroll_visible(
+            status_scroll,
+            *status_selected_line,
+            viewport,
+            total_lines,
+        );
+    }
+
+    let status_items: Vec<ListItem> = status_lines_vec
+        .iter()
+        .skip(*status_scroll)
+        .take(viewport)
+        .map(|ln| ListItem::new(truncate_to_width(ln, tw1)))
+        .collect();
+
+    let mut status_list_state = ListState::default();
+    if total_lines > 0 {
+        let rel = (*status_selected_line).saturating_sub(*status_scroll);
+        if rel < status_items.len() {
+            status_list_state.select(Some(rel));
+        }
+    }
+
+    let status_list = List::new(status_items)
+        .block(b_status)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
 
     let p2 = Paragraph::new("stash").block(
         Block::default()
@@ -908,65 +1207,8 @@ fn draw_repo_detail(
             .border_style(b_style(FocusField::Stash)),
     );
 
-    frame.render_widget(p0, chunks[0]);
-    frame.render_widget(p1, chunks[1]);
+    frame.render_stateful_widget(status_list, chunks[1], &mut status_list_state);
     frame.render_widget(p2, chunks[2]);
-}
-
-fn draw_branch_select(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    rows: &[Row],
-    repo_idx: usize,
-    filter: &str,
-    branches: &[String],
-    list_state: &mut ListState,
-) {
-    let filtered: Vec<&String> = branches
-        .iter()
-        .filter(|b| branch_matches_filter(b, filter))
-        .collect();
-
-    let nf = filtered.len();
-    if nf == 0 {
-        list_state.select(None);
-    } else {
-        let sel = list_state.selected().unwrap_or(0).min(nf - 1);
-        list_state.select(Some(sel));
-    }
-
-    let title_raw = format!(
-        "branches [{}] — filter: {}",
-        rows
-            .get(repo_idx)
-            .and_then(|r| match r {
-                Row::Git { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .unwrap_or(""),
-        if filter.is_empty() {
-            "(type to filter)".to_string()
-        } else {
-            filter.to_string()
-        }
-    );
-    let title = truncate_to_width(&title_raw, area.width.saturating_sub(4).max(1));
-
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    let text_w = inner.width.saturating_sub(2).max(1);
-
-    let items: Vec<ListItem> = filtered
-        .iter()
-        .map(|b| ListItem::new(truncate_to_width(b.as_str(), text_w)))
-        .collect();
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("> ");
-
-    frame.render_stateful_widget(list, area, list_state);
 }
 
 fn draw_confirm_reset(frame: &mut Frame<'_>, area: Rect, rows: &[Row], repo_idx: usize) {
