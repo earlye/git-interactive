@@ -12,7 +12,7 @@ jobs:
       patch: ${{ steps.version.outputs.patch }}
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Calculate version
         id: version
         run: |
@@ -30,22 +30,22 @@ jobs:
             name: darwin-arm64
           - os: macos-latest        # Intel runner
             name: darwin-x86_64
-    
+
     runs-on: ${{ matrix.os }}
-    
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      
+
       - name: Build
         run: make PATCH="${{ needs.version.outputs.patch }}" QUIET=1
-      
+
       - name: Package
         run: |
           tar -czvf git-interactive-${{ matrix.name }}-v${{ needs.version.outputs.version }}.tar.gz -C dist/bin .
-      
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -60,17 +60,17 @@ jobs:
     outputs:
       arm64_sha: ${{ steps.sha.outputs.arm64 }}
       x86_64_sha: ${{ steps.sha.outputs.x86_64 }}
-    
+
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-      
+
       - name: List artifacts
         run: ls -la artifacts/
-      
+
       - name: Calculate SHA256
         id: sha
         run: |
@@ -78,7 +78,7 @@ jobs:
           X86_64_SHA=$(shasum -a 256 artifacts/*darwin-x86_64*.tar.gz | cut -d' ' -f1)
           echo "arm64=$ARM64_SHA" >> $GITHUB_OUTPUT
           echo "x86_64=$X86_64_SHA" >> $GITHUB_OUTPUT
-      
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -90,7 +90,7 @@ jobs:
   update-homebrew:
     needs: [version, release]
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Trigger Homebrew tap update
         env:

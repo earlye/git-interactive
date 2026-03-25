@@ -11,6 +11,7 @@ MAJOR := 0
 MINOR := 1
 PATCH ?= 99999+local-$(shell git rev-parse --abbrev-ref HEAD 2> /dev/null)-$(shell git rev-list --count HEAD 2>/dev/null)-$(shell git rev-parse --short HEAD)
 VERSION := $(MAJOR).$(MINOR).$(PATCH)
+TAG := $(patsubst $(VERSION),-,_)
 log = $(if $(QUIET),,$(info $(1)))
 
 $(call log,entering directory `$(shell pwd)')
